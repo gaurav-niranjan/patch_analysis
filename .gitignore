@@ -1,0 +1,14 @@
+# Data files to ignore
+*.parquet
+*.png
+*.err
+*.out
+
+# uv / Python
+.venv/
+__pycache__/
+*.pyc
+.python-version
+uv.lock        # optional: include this if you want reproducible installs, exclude if not
+dist/
+*.egg-info/
