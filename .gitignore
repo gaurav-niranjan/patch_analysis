@@ -3,12 +3,15 @@
 *.png
 *.err
 *.out
+*.pt
 
 # uv / Python
 .venv/
 __pycache__/
 *.pyc
 .python-version
-uv.lock        # optional: include this if you want reproducible installs, exclude if not
+uv.lock
 dist/
 *.egg-info/
+
+jobs/logs/

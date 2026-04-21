@@ -7,7 +7,7 @@
 #SBATCH --cpus-per-task=4
 #SBATCH --partition=h100-ferranti
 #SBATCH --mem=64G
-#SBATCH --time=00:30:00 # walltime  for example request one default gpu
+#SBATCH --time=00:40:00 # walltime  for example request one default gpu
 #SBATCH --gpus=1
 #SBATCH --mail-type=ALL
 #SBATCH --mail-user=gaurav.niranjan@student.uni-tuebingen.de
@@ -19,4 +19,4 @@ source .venv/bin/activate
 
 cd jobs
 
-python inpainted_sw.py
+python qwen/sw_dataset_embs.py

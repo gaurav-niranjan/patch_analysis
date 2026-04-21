@@ -84,9 +84,9 @@ def make_ablation_hook(selected_positions, replacement_value, per_position=False
         if hidden_states.shape[1] > 1:
             hidden_states = hidden_states.clone()
             if per_position:
-                hidden_states[0, selected_positions, :] = replacement_value[replacement_indices, :]
+                hidden_states[0, selected_positions, :] = replacement_value[replacement_indices, :].to(hidden_states.device, hidden_states.dtype)
             else:
-                hidden_states[0, selected_positions, :] = replacement_value
+                hidden_states[0, selected_positions, :] = replacement_value.to(hidden_states.device, hidden_states.dtype)
             return (hidden_states,) + args[1:]
         return None
 
@@ -121,3 +121,68 @@ def ablated_forward(
     finally:
         for h in handles:
             h.remove()
+
+def get_deepstack_visual_embeds(model, inputs):
+    with torch.no_grad():
+        image_embeds, deepstack_visual_embeds = model.visual(inputs['pixel_values'],inputs['image_grid_thw'])
+    return image_embeds, deepstack_visual_embeds #type: List[Tensor] of length num_deepstack, each of shape (num_image_tokens, hidden_dim)
+
+def make_embed_ablation_hook(selected_positions, mean_embeds, replacement_indices):
+    def hook(module, args):
+        hidden_states = args[0]
+        if hidden_states.shape[1] > 1:
+            hidden_states = hidden_states.clone()
+            hidden_states[0, selected_positions, :] = mean_embeds[replacement_indices].to(hidden_states.device, hidden_states.dtype)
+            return (hidden_states,) + args[1:]
+        return None
+    return hook
+
+def make_deepstack_ablation_hook(replacement_indices, mean_ds):
+    def hook(module, args, kwargs):
+        ds = kwargs.get("deepstack_visual_embeds")
+        assert ds is not None, "Expected deepstack_visual_embeds in kwargs for deepstack ablation hook"
+        if ds is not None:
+            ds = [d.clone() for d in ds]
+            for i in range(len(ds)):
+                ds[i][replacement_indices] = mean_ds[i][replacement_indices].to(ds[i].device, ds[i].dtype)
+            kwargs["deepstack_visual_embeds"] = ds
+        return args, kwargs
+    return hook
+
+def ablated_forward_deepstack(
+    model,
+    inputs,
+    selected_positions,
+    all_image_positions,
+    mean_embeds,
+    mean_ds,
+    ablate_initial=True,
+    ablate_ds=True,
+    generate=False,
+    max_new_tokens=128,
+):
+    pos_to_idx = {pos: idx for idx, pos in enumerate(all_image_positions)}
+    repl_idx = [pos_to_idx[p] for p in selected_positions]
+
+    handles = []
+
+    if ablate_initial:
+        hook = make_embed_ablation_hook(selected_positions, mean_embeds, repl_idx)
+        handle = model.model.language_model.layers[0].register_forward_pre_hook(hook)
+        handles.append(handle)
+
+    if ablate_ds:
+        hook = make_deepstack_ablation_hook(repl_idx, mean_ds)
+        handle = model.model.language_model.register_forward_pre_hook(hook, with_kwargs=True)
+        handles.append(handle)
+
+    try:
+        with torch.no_grad():
+            if generate:
+                return model.generate(**inputs, max_new_tokens=max_new_tokens)
+            else:
+                return model(**inputs)
+    finally:
+        for h in handles:
+            h.remove()
+

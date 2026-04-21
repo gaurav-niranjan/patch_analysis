@@ -20,6 +20,12 @@ def downsample_image(img: Image.Image, short_side=1536):
 
     return img.resize((new_W, new_H), Image.Resampling.LANCZOS)
 
+def downsample_qwen3_8b_p0(img: Image.Image, target_size=(1344, 896)):
+    return img.resize(target_size, Image.Resampling.LANCZOS)
+
+def downsample_gemma3_12b(img: Image.Image, target_size=(896, 896)):
+    return img.resize(target_size, Image.Resampling.BILINEAR)
+
 def build_prompt(example):
     return (
         #"You are answering a multiple-choice question about the image.\n\n"  
@@ -58,7 +64,7 @@ def get_textonly_input(processor, ds, id_to_index, sample_id):
     return inputs
 
 
-def get_input(processor, ds, id_to_index, sample_id, IMAGE_DIR, inpaited=False, style=None):
+def get_input(processor, ds, id_to_index, sample_id, IMAGE_DIR, downsample, inpaited=False, style=None,):
 
     if inpaited:
         if style == 'female_bg':
@@ -70,7 +76,7 @@ def get_input(processor, ds, id_to_index, sample_id, IMAGE_DIR, inpaited=False, 
     else:
         image_path = IMAGE_DIR / sample_id / 'original.png'
     
-    image = downsample_image(Image.open(image_path).convert("RGB"))
+    image = downsample(Image.open(image_path).convert("RGB"))
             
     prompt = build_prompt(ds[id_to_index[sample_id]])
 
@@ -208,32 +214,41 @@ def visualize_qwen3vl_patches(
 
 def sliding_window_on_grid(
     patch_map,
-    image_grid_thw,
-    k: int = None,            # fixed window size in grid cells
-    frac: float = None,       # fractional window size (e.g. 0.33)
-    stride: int = None,       # explicit stride; if None, auto = max(1, win_size // 2)
+    k: int = None,
+    frac: float = None,
+    stride: int = None,
+    # Qwen3-VL params
+    image_grid_thw=None,
     merge_size: int = 2,
+    # Gemma 3 params
+    mm_tokens_per_image: int = None,
 ):
     """
     Slide a square window over the token grid.
-    
+    Works for both Qwen3-VL (variable grid) and Gemma 3 (fixed 16×16).
+
     Window size is set by exactly one of:
       - k: fixed side length in grid cells
       - frac: fraction of the shorter grid axis (e.g. 0.33 → 33%)
-    
+
     Yields (row, col, token_positions) per window.
     """
     if (k is None) == (frac is None):
         raise ValueError("Provide exactly one of k or frac")
 
-    t, h_pre, w_pre = image_grid_thw[0].tolist()
-    grid_h = h_pre // merge_size
-    grid_w = w_pre // merge_size
+    # Resolve grid dimensions
+    if image_grid_thw is not None:
+        t, h_pre, w_pre = image_grid_thw[0].tolist()
+        grid_h = h_pre // merge_size
+        grid_w = w_pre // merge_size
+    elif mm_tokens_per_image is not None:
+        grid_h = grid_w = int(mm_tokens_per_image ** 0.5)
+    else:
+        raise ValueError("Provide either image_grid_thw (Qwen3) or mm_tokens_per_image (Gemma3)")
 
     win = k if k is not None else max(2, round(min(grid_h, grid_w) * frac))
     step = stride if stride is not None else max(1, win // 2)
 
-    # Build lookup: (row, col) -> LLM token index
     rc_to_token = {(info["row"], info["col"]): pos
                    for pos, info in patch_map.items()}
 
@@ -245,4 +260,61 @@ def sliding_window_on_grid(
                 for c in range(col, col + win)
             ]
             yield row, col, tokens
+
+def build_gemma3_patch_to_pixel_map(
+    input_ids: torch.Tensor,
+    image_token_id: int = 262144,
+    original_height: int = None,
+    original_width: int = None,
+    image_size: int = 896,
+    patch_size: int = 14,
+    mm_tokens_per_image: int = 256,
+):
+    """
+    Map each image token back to a pixel bounding box for Gemma 3.
+
+    Pipeline (all fixed, no variable grid):
+      - Input:  896 × 896
+      - Patch:  14 × 14  → 64 × 64 = 4096 patches
+      - Pool:   4 × 4 avg pool → 16 × 16 = 256 tokens per image
+      - Each token covers 14 * 4 = 56 pixels in each dimension
+    """
+
+    patches_per_side = image_size // patch_size                    # 64
+    tokens_per_side = int(mm_tokens_per_image ** 0.5)              # 16
+    pool_size = patches_per_side // tokens_per_side                # 4
+    effective_patch = patch_size * pool_size                        # 56
+
+    pad_positions = torch.where(input_ids == image_token_id)[0]
+    num_images = len(pad_positions) // mm_tokens_per_image
+
+    mapping = {}
+
+    for img_idx in range(num_images):
+        for local_idx in range(mm_tokens_per_image):
+            global_pos = pad_positions[img_idx * mm_tokens_per_image + local_idx].item()
+
+            row = local_idx // tokens_per_side
+            col = local_idx % tokens_per_side
+
+            x1 = col * effective_patch
+            y1 = row * effective_patch
+            x2 = x1 + effective_patch
+            y2 = y1 + effective_patch
+
+            info = {
+                "image_idx": img_idx,
+                "row": row,
+                "col": col,
+                "bbox_resized": (x1, y1, x2, y2),
+            }
+
+            if original_height and original_width:
+                sx = original_width / image_size
+                sy = original_height / image_size
+                info["bbox_original"] = (x1 * sx, y1 * sy, x2 * sx, y2 * sy)
+
+            mapping[global_pos] = info
+
+    return mapping
 
